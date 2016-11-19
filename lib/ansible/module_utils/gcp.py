@@ -83,14 +83,14 @@ def _get_gcp_environment_credentials(service_account_email, credentials_file, pr
     """Helper to look in environment variables for credentials."""
     # If any of the values are not given as parameters, check the appropriate
     # environment variables.
-    if not service_account_email:
+    if service_account_email is None:
         service_account_email = _get_gcp_environ_var('GCE_EMAIL', None)
-    if not credentials_file:
+    if credentials_file is None:
         credentials_file = _get_gcp_environ_var(
             'GCE_CREDENTIALS_FILE_PATH', None) or _get_gcp_environ_var(
                 'GOOGLE_APPLICATION_CREDENTIALS', None) or _get_gcp_environ_var(
                     'GCE_PEM_FILE_PATH', None)
-    if not project_id:
+    if  project_id is None:
         project_id = _get_gcp_environ_var('GCE_PROJECT', None) or _get_gcp_environ_var(
             'GOOGLE_CLOUD_PROJECT', None)
     return (service_account_email, credentials_file, project_id)
@@ -125,12 +125,12 @@ def _get_gcp_libcloud_credentials(service_account_email=None, credentials_file=N
         except ImportError:
             secrets = None
         if hasattr(secrets, 'GCE_PARAMS'):
-            if not service_account_email:
+            if service_account_email is None:
                 service_account_email = secrets.GCE_PARAMS[0]
-            if not credentials_file:
+            if credentials_file is None:
                 credentials_file = secrets.GCE_PARAMS[1]
         keyword_params = getattr(secrets, 'GCE_KEYWORD_PARAMS', {})
-        if not project_id:
+        if project_id is None:
             project_id = keyword_params.get('project', None)
     return (service_account_email, credentials_file, project_id)
 
@@ -241,7 +241,7 @@ def _validate_credentials_file(module, credentials_file, require_valid_json=True
                                      'Upgrade to libcloud>=0.17.0.')
             return True
     except IOError as e:
-        module.fail_json(msg='GCP Credentials File %s not found.' % credentials_file, changed=False)
+        display.warning(msg='GCP Credentials File %s not found.' % credentials_file)
         return False
     except ValueError as e:
         if require_valid_json:
