@@ -126,8 +126,9 @@ options:
     description:
       - a list of persistent disks to attach to the instance; a string value
         gives the name of the disk; alternatively, a dictionary value can
-        define 'name' and 'mode' ('READ_ONLY' or 'READ_WRITE'). The first entry
-        will be the boot disk (which must be READ_WRITE).
+        define 'name', 'mode' ('READ_ONLY' or 'READ_WRITE'), disk_type ('pd-standard',
+        'pd-ssd' or 'local-ssd', image, size_gb, snapshot, disk_interface ('SCSI' or
+        'NVME'). The first entry will be the boot disk (which must be READ_WRITE).
     required: false
     default: null
     version_added: "1.7"
@@ -342,7 +343,8 @@ def get_instance_info(inst):
         disk_names = [disk_info['source'].split('/')[-1]
                       for disk_info
                       in sorted(inst.extra['disks'],
-                                key=lambda disk_info: disk_info['index'])]
+                                key=lambda disk_info: disk_info['index'])
+                      if 'source' in disk_info]
     else:
         disk_names = []
 
@@ -417,19 +419,67 @@ def create_instances(module, gce, instance_names, number):
     new_instances = []
     changed = False
 
-    lc_disks = []
-    disk_modes = []
-    for i, disk in enumerate(disks or []):
-        if isinstance(disk, dict):
-            lc_disks.append(gce.ex_get_volume(disk['name']))
-            disk_modes.append(disk['mode'])
-        else:
-            lc_disks.append(gce.ex_get_volume(disk))
-            # boot disk is implicitly READ_WRITE
-            disk_modes.append('READ_ONLY' if i > 0 else 'READ_WRITE')
     lc_network = gce.ex_get_network(network)
     lc_machine_type = gce.ex_get_size(machine_type)
     lc_zone = gce.ex_get_zone(zone)
+
+    lc_disks = None
+    if disks is not None:
+        lc_disks = []
+        for i, disk in enumerate(disks):
+            lc_disk = {}
+            lc_init_params = None
+
+            if isinstance(disk, dict):
+                if 'name' in disk:
+                    try:
+                        # Check if volume already exists
+                        pd = gce.ex_get_volume("%s" % disk['name'], lc_zone)
+                        lc_disk['source'] = pd.extra['selfLink']
+                    except ResourceNotFoundError:
+                        lc_disk['deviceName'] = disk['name']
+                        lc_init_params = {}
+
+                        if 'disk_type' not in disk or disk['disk_type'] != 'local-ssd':
+                            lc_init_params = {'diskName' : disk['name']}
+
+                        if 'size_gb' in disk:
+                            lc_init_params['diskSizeGb'] = disk['size_gb']
+
+                        if 'disk_type' in disk:
+                            lc_init_params['diskType'] = gce.ex_get_disktype(disk['disk_type']).extra['selfLink']
+                            lc_disk['type'] = 'SCRATCH' if disk['disk_type'] == 'local-ssd' else 'PERSISTENT'
+
+                        if 'disk_interface' in disk:
+                            lc_disk['interface'] = disk['disk_interface']
+
+                        if 'image' in disk:
+                            lc_init_params['sourceImage'] = gce.ex_get_image("%s" % disk['image']).extra['selfLink']
+
+                        if 'snapshot' in disk:
+                            lc_init_params['sourceImage'] = gce.ex_get_snapshot("%s" % disk['snapshot']).extra['selfLink']
+
+                        lc_disk['initializeParams'] = lc_init_params
+                if 'mode' in disk:
+                    lc_disk['mode'] = disk['mode']
+                if 'delete_on_termination' in disk:
+                    lc_disk['autoDelete'] = disk.get('delete_on_termination')
+            else:
+                if 'name' in disk:
+                    try:
+                        # Check if volume already exists
+                        pd = gce.ex_get_volume("%s" % disk['name'], lc_zone)
+                        lc_disk['source'] = pd.extra['selfLink']
+                    except ResourceNotFoundError:
+                        lc_init_params = {'diskName' : disk['name']}
+                # boot disk is implicitly READ_WRITE
+                lc_disk['mode'] = 'READ_ONLY' if i > 1 else 'READ_WRITE'
+
+            # First disk is boot disk
+            if i == 0:
+                lc_disk['boot'] = True
+
+            lc_disks.append(lc_disk);
 
     # Try to convert the user's metadata value into the format expected
     # by GCE.  First try to ensure user has proper quoting of a
@@ -478,7 +528,7 @@ def create_instances(module, gce, instance_names, number):
     gce_args = dict(
         location=lc_zone,
         ex_network=network, ex_tags=tags, ex_metadata=metadata,
-        ex_can_ip_forward=ip_forward,
+        ex_can_ip_forward=ip_forward, ex_disks_gce_struct=lc_disks,
         external_ip=instance_external_ip, ex_disk_auto_delete=disk_auto_delete,
         ex_service_accounts=ex_sa_perms
     )
@@ -507,9 +557,7 @@ def create_instances(module, gce, instance_names, number):
     else:
         for instance in instance_names:
             pd = None
-            if lc_disks:
-                pd = lc_disks[0]
-            elif persistent_boot_disk:
+            if persistent_boot_disk:
                 try:
                     pd = gce.ex_get_volume("%s" % instance, lc_zone)
                 except ResourceNotFoundError:
@@ -529,29 +577,6 @@ def create_instances(module, gce, instance_names, number):
                                  'instance %s, error: %s' % (instance, e.value))
             if inst:
                 new_instances.append(inst)
-
-    for inst in new_instances:
-        for i, lc_disk in enumerate(lc_disks):
-            # Check whether the disk is already attached
-            if (len(inst.extra['disks']) > i):
-                attached_disk = inst.extra['disks'][i]
-                if attached_disk['source'] != lc_disk.extra['selfLink']:
-                    module.fail_json(
-                        msg=("Disk at index %d does not match: requested=%s found=%s" % (
-                            i, lc_disk.extra['selfLink'], attached_disk['source'])))
-                elif attached_disk['mode'] != disk_modes[i]:
-                    module.fail_json(
-                        msg=("Disk at index %d is in the wrong mode: requested=%s found=%s" % (
-                            i, disk_modes[i], attached_disk['mode'])))
-                else:
-                    continue
-            gce.attach_volume(inst, lc_disk, ex_mode=disk_modes[i])
-            # Work around libcloud bug: attached volumes don't get added
-            # to the instance metadata. get_instance_info() only cares about
-            # source and index.
-            if len(inst.extra['disks']) != i+1:
-                inst.extra['disks'].append(
-                    {'source': lc_disk.extra['selfLink'], 'index': i})
 
     instance_names = []
     instance_json_data = []
